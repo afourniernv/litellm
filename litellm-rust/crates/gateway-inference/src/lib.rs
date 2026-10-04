@@ -11,6 +11,8 @@ pub mod messages;
 mod ocr;
 mod request;
 mod responses;
+#[cfg(feature = "switchyard")]
+pub mod switchyard;
 
 use std::sync::Arc;
 
