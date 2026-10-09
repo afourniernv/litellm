@@ -1,7 +1,10 @@
 use litellm_auth::SecretValue;
 use litellm_core_utils::settings::Lookup;
 use litellm_http::request::with_default_headers;
-use litellm_llms::base_llm::{auth::ValidatedEnvironment, chat::transformation::BaseConfig};
+use litellm_llms::base_llm::{
+    auth::ValidatedEnvironment,
+    chat::transformation::{BaseConfig, STREAM_PARAM},
+};
 use litellm_llms_types::formats::chat_completions::ChatMessage;
 use litellm_secrets::source::Secrets;
 use serde_json::Value;
@@ -73,6 +76,24 @@ pub(super) fn resolve_request(
         extra_headers: request.extra_headers,
         timeout: request.timeout,
     })
+}
+
+pub(super) fn resolve_output_request(
+    mut request: ChatCompletionsRequest<'_>,
+) -> Result<ResolvedChatCompletionsRequest<'_>, Error> {
+    let stream = request.optional_params.remove(STREAM_PARAM);
+    let mut resolved = resolve_request(request)?;
+    if stream.as_ref().and_then(Value::as_bool) == Some(true)
+        && resolved.custom_llm_provider != "openai_like"
+    {
+        return Err(Error::Unsupported("streaming"));
+    }
+    if let Some(stream) = stream {
+        resolved
+            .optional_params
+            .insert(STREAM_PARAM.to_string(), stream);
+    }
+    Ok(resolved)
 }
 
 fn validate_environment(

@@ -5,17 +5,26 @@ use litellm_host::{
 };
 use std::time::Duration;
 
+use futures_util::StreamExt;
+use litellm_host::call::CallOutput;
 use litellm_http::transport::Error as TransportError;
 use litellm_inference_chat::{Error, types::ChatCompletionsRequest};
 use litellm_llms_types::formats::chat_completions::ChatCompletionsResponse;
 use rstest::{fixture, rstest};
 use serde_json::{Map, Value, json};
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::TcpListener,
+    task::JoinHandle,
+};
 use wiremock::ResponseTemplate;
 
 mod support;
 use support::*;
 
 const ANTHROPIC_MESSAGE: &str = r#"{"id":"msg_1","type":"message","role":"assistant","model":"claude-sonnet-4-5-20260101","content":[{"type":"text","text":"hello"}],"stop_reason":"end_turn","stop_sequence":null,"usage":{"input_tokens":11,"output_tokens":4}}"#;
+const OPENAI_STREAM_CHUNK: &[u8] =
+    b"data: {\"id\":\"chatcmpl-1\",\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n";
 
 async fn complete(request: ChatCompletionsRequest<'_>) -> Result<ChatCompletionsResponse, Error> {
     chat_completions_route().execute(request, &(), None).await
@@ -36,6 +45,31 @@ fn hi() -> Value {
     json!([{"role": "user", "content": "hi"}])
 }
 
+async fn stalling_chat_stream() -> (String, JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let connection = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut request = vec![0; 4096];
+        let _ = socket.read(&mut request).await;
+        socket
+            .write_all(
+                format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n\
+                     transfer-encoding: chunked\r\n\r\n{:x}\r\n",
+                    OPENAI_STREAM_CHUNK.len()
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        socket.write_all(OPENAI_STREAM_CHUNK).await.unwrap();
+        socket.write_all(b"\r\n").await.unwrap();
+        let _ = socket.read_to_end(&mut Vec::new()).await;
+    });
+    (base, connection)
+}
+
 #[fixture]
 fn request() -> ChatCompletionsRequest<'static> {
     ChatCompletionsRequest {
@@ -48,6 +82,51 @@ fn request() -> ChatCompletionsRequest<'static> {
         extra_headers: None,
         timeout: Some(Duration::from_secs(10)),
     }
+}
+
+#[rstest]
+#[tokio::test]
+async fn raw_sse_arrives_before_completion_and_drop_closes_the_upstream(
+    request: ChatCompletionsRequest<'static>,
+) {
+    let (base, connection) = stalling_chat_stream().await;
+    let output = tokio::time::timeout(
+        Duration::from_secs(5),
+        chat_completions_route().execute_output(
+            ChatCompletionsRequest {
+                model: "openai_like/test",
+                optional_params: object(json!({"stream": true})),
+                api_base: Some(&base),
+                timeout: Some(Duration::from_secs(30)),
+                ..request
+            },
+            &(),
+            None,
+        ),
+    )
+    .await
+    .expect("headers arrive before the upstream finishes")
+    .unwrap();
+    let CallOutput::Stream { head, mut chunks } = output else {
+        panic!("a streaming request returns a stream")
+    };
+    assert!(
+        head.headers
+            .contains(&("content-type".into(), "text/event-stream".into()))
+    );
+    let chunk = tokio::time::timeout(Duration::from_secs(5), chunks.next())
+        .await
+        .expect("the first bytes arrive before the upstream finishes")
+        .unwrap()
+        .unwrap();
+    assert_eq!(chunk, OPENAI_STREAM_CHUNK);
+    assert!(!connection.is_finished());
+
+    drop(chunks);
+    tokio::time::timeout(Duration::from_secs(5), connection)
+        .await
+        .expect("dropping the stream closes the upstream connection")
+        .unwrap();
 }
 
 #[rstest]

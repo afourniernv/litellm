@@ -2,9 +2,12 @@ use litellm_secrets::source::Secrets;
 use std::time::Duration;
 
 use litellm_auth::SecretValue;
+use litellm_host::call::CallOutput;
 use litellm_llms::base_llm::{auth::ValidatedEnvironment, chat::transformation::BaseConfig};
-use litellm_llms_types::formats::chat_completions::ChatMessage;
+use litellm_llms_types::formats::chat_completions::{ChatCompletionsResponse, ChatMessage};
 use serde_json::{Map, Value};
+
+use super::Error;
 
 /// A `/chat/completions` call as it crosses into the core.
 ///
@@ -33,6 +36,15 @@ pub struct ChatCompletionsCall {
     pub extra_headers: Option<Map<String, Value>>,
     pub timeout: Option<Duration>,
 }
+
+/// Headers returned before raw Chat Completions SSE bytes.
+pub struct ChatCompletionsStreamHead {
+    pub headers: Vec<(String, String)>,
+}
+
+/// A buffered Chat Completions response or raw SSE stream.
+pub type ChatCompletionsOutput =
+    CallOutput<ChatCompletionsResponse, ChatCompletionsStreamHead, bytes::Bytes, Error>;
 
 impl From<ChatCompletionsRequest<'_>> for ChatCompletionsCall {
     fn from(request: ChatCompletionsRequest<'_>) -> Self {

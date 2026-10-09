@@ -70,8 +70,15 @@ impl ChatCompletionsRoute {
                 extra_headers: call.extra_headers,
                 timeout: call.timeout,
             };
-            self.run(request, cache_options, interceptors, observers)
-                .await
+            match self
+                .run(request, cache_options, interceptors, observers, false)
+                .await?
+            {
+                CallOutput::Complete(response) => Ok(response),
+                CallOutput::Stream { .. } => Err(Error::InvalidResponse(
+                    "unary chat completions returned a stream".into(),
+                )),
+            }
         })
         .await
     }

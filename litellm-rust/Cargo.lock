@@ -4032,6 +4032,7 @@ dependencies = [
 name = "litellm-inference-chat"
 version = "0.1.0"
 dependencies = [
+ "bytes",
  "futures-util",
  "litellm-auth",
  "litellm-cache-memory",

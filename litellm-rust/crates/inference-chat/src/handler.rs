@@ -1,28 +1,38 @@
-use litellm_host::{lifecycle::ExecutionEvent, observation::ObservationSender};
+use futures_util::StreamExt;
+use litellm_host::{
+    call::CallOutput,
+    interceptors::{
+        ExecutionFacts, Interceptors, ProviderIdentity, RawResponse, RequestContext, ResultSource,
+        WireRequest,
+    },
+    lifecycle::{CallEvent, ExecutionEvent},
+    observation::ObservationSender,
+};
 use std::time::Duration;
 
 use litellm_auth::AuthServices;
-use litellm_host::interceptors::{Interceptors, RawResponse, RequestContext, WireRequest};
 use litellm_http::{Client, outbound::OutboundRequest, request::truncate_error_body};
 use litellm_llms::base_llm::{
     auth::{Authenticated, resolve_auth},
     chat::transformation::ProviderChatResponseData,
 };
-use litellm_llms_types::formats::chat_completions::ChatCompletionsResponse;
 use serde_json::Value;
 
 use super::Error;
-use crate::{constants::CHAT_COMPLETIONS_TIMEOUT_SECS, types::ProviderChatCompletionsRequest};
+use crate::{
+    constants::CHAT_COMPLETIONS_TIMEOUT_SECS,
+    types::{ChatCompletionsOutput, ChatCompletionsStreamHead, ProviderChatCompletionsRequest},
+};
 
 pub(super) async fn execute(
     http: &Client,
     auth: &AuthServices,
     request: ProviderChatCompletionsRequest,
-    cache: Option<litellm_cache_response::ScopedCache>,
+    cache: Option<&litellm_cache_response::ScopedCache>,
     cache_options: Option<litellm_cache_response::CachePolicy>,
     interceptors: &impl Interceptors<Error>,
     observers: Option<&ObservationSender>,
-) -> Result<ChatCompletionsResponse, Error> {
+) -> Result<ChatCompletionsOutput, Error> {
     let ProviderChatCompletionsRequest {
         model,
         custom_llm_provider,
@@ -43,7 +53,7 @@ pub(super) async fn execute(
         api_key,
     };
     let authenticated = resolve_auth(auth, environment, &|key| secrets.get(key)).await?;
-    let identity = litellm_host::interceptors::ProviderIdentity {
+    let identity = ProviderIdentity {
         model: context.model.clone(),
         provider: context.custom_llm_provider.clone(),
     };
@@ -57,15 +67,74 @@ pub(super) async fn execute(
             context,
         )
         .await?;
+    let stream = wire
+        .body
+        .get("stream")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    if stream {
+        if identity.provider != "openai_like" {
+            return Err(Error::Unsupported("streaming"));
+        }
+        let outbound = outbound_request(
+            Authenticated {
+                headers: wire.headers,
+                signer: authenticated.signer,
+            },
+            wire.url,
+            &wire.body,
+            timeout,
+        )?;
+        let response = litellm_inference::outbound::send(outbound, http)
+            .await
+            .map_err(|error| {
+                Error::Transport(
+                    litellm_http::transport::Error::from_reqwest_before_dispatch(error),
+                )
+            })?;
+        let status = response.status();
+        if !status.is_success() {
+            let body = response
+                .text()
+                .await
+                .map_err(|error| Error::Transport(error.into()))?;
+            return Err(Error::Transport(litellm_http::transport::Error::Http {
+                status: status.as_u16(),
+                body: truncate_error_body(&body),
+            }));
+        }
+        let headers = response
+            .headers()
+            .iter()
+            .filter_map(|(name, value)| Some((name.to_string(), value.to_str().ok()?.to_owned())))
+            .collect();
+        let chunks = response
+            .bytes_stream()
+            .map(|chunk| chunk.map_err(|error| Error::Transport(error.into())))
+            .boxed();
+        let facts = ExecutionFacts {
+            provider: identity,
+            source: ResultSource::Provider,
+        };
+        if let Some(observers) = observers {
+            observers.emit(CallEvent::Execution(ExecutionEvent::ResultReady {
+                facts: facts.clone(),
+            }));
+        }
+        interceptors.result_ready(facts).await?;
+        return Ok(CallOutput::Stream {
+            head: ChatCompletionsStreamHead { headers },
+            chunks,
+        });
+    }
+
     let cache = cache.filter(|_| authenticated.signer.is_none());
-    let cache_request = litellm_inference::caching::CacheRequest::from_wire(
-        identity,
-        cache.as_ref().map(|_| &wire),
-    );
+    let cache_request =
+        litellm_inference::caching::CacheRequest::from_wire(identity, cache.map(|_| &wire));
     litellm_inference::caching::execute_unary::<super::route::ChatCompletions, _, _>(
         cache_request,
-        cache.as_ref().map(|cache| cache.service.clone()),
-        cache.as_ref().map(|cache| cache.options(cache_options)),
+        cache.map(|cache| cache.service.clone()),
+        cache.map(|cache| cache.options(cache_options)),
         interceptors,
         observers,
         || async move {
@@ -127,6 +196,7 @@ pub(super) async fn execute(
         },
     )
     .await
+    .map(CallOutput::Complete)
 }
 
 /// Re-tag an error raised while normalizing a response the provider already
@@ -298,7 +368,8 @@ mod tests {
             None,
         )
         .await
-        .expect_err("the upstream failure fails the call");
+        .err()
+        .expect("the upstream failure fails the call");
 
         assert!(matches!(
             error,
